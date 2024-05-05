@@ -1,0 +1,26 @@
+From 2d1e4150a541862cd184851d866039db5f33429f Mon Sep 17 00:00:00 2001
+From: Markus Gothe <markus.gothe@genexis.eu>
+Date: Thu, 11 May 2023 16:59:39 +0200
+Subject: airoha: Enable UART FIFO
+
+Our HW team has been reporting TTY buffer overruns.
+By enabling the 8-byte HW RX FIFO in the SoC these
+issues are resolved.
+
+diff --git a/drivers/tty/serial/8250/8250_port.c b/drivers/tty/serial/8250/8250_port.c
+index 13009ace1..1e1906a2f 100644
+--- a/drivers/tty/serial/8250/8250_port.c
++++ b/drivers/tty/serial/8250/8250_port.c
+@@ -311,8 +311,11 @@ static const struct serial8250_config uart_config[] = {
+ 	},
+ 	[PORT_AIROHA] = {
+ 		.name		= "Airoha 16550",
+-		.fifo_size	= 1,
++		.fifo_size	= 8,
+ 		.tx_loadsz	= 1,
++		.fcr		= UART_FCR_ENABLE_FIFO | UART_FCR_R_TRIG_01,
++		.rxtrig_bytes	= {1, 4},
++		.flags		= UART_CAP_FIFO,
+ 	},
+ };
+ 

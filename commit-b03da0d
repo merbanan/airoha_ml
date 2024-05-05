@@ -1,0 +1,397 @@
+From b03da0db7886aa083c692fd2f29a2222994f2b2a Mon Sep 17 00:00:00 2001
+From: Michael Polyntsov <michael.polyntsov@iopsys.eu>
+Date: Thu, 27 Apr 2023 20:48:42 +0100
+Subject: airoha: watchdog: Add alternative watchdog driver for en75xx
+
+
+diff --git a/drivers/watchdog/Kconfig b/drivers/watchdog/Kconfig
+index e2745f686..bfbb1a6e1 100644
+--- a/drivers/watchdog/Kconfig
++++ b/drivers/watchdog/Kconfig
+@@ -213,6 +213,13 @@ config DA9062_WATCHDOG
+ 
+ 	  This driver can be built as a module. The module name is da9062_wdt.
+ 
++config EN7512_WDT
++	tristate "Econet EN7512 watchdog"
++	depends on ARCH_ECONET
++	select WATCHDOG_CORE
++	help
++	  Support for the watchdog in the EN75xx.
++
+ config GPIO_WATCHDOG
+ 	tristate "Watchdog device controlled through GPIO-line"
+ 	depends on OF_GPIO
+diff --git a/drivers/watchdog/Makefile b/drivers/watchdog/Makefile
+index 2ee352bf3..1b01b2575 100644
+--- a/drivers/watchdog/Makefile
++++ b/drivers/watchdog/Makefile
+@@ -171,6 +171,7 @@ obj-$(CONFIG_IMGPDC_WDT) += imgpdc_wdt.o
+ obj-$(CONFIG_MT7621_WDT) += mt7621_wdt.o
+ obj-$(CONFIG_PIC32_WDT) += pic32-wdt.o
+ obj-$(CONFIG_PIC32_DMT) += pic32-dmt.o
++obj-$(CONFIG_EN7512_WDT) += tc_wdt.o
+ 
+ # PARISC Architecture
+ 
+diff --git a/drivers/watchdog/tc_wdt.c b/drivers/watchdog/tc_wdt.c
+new file mode 100644
+index 000000000..ef26bffc2
+--- /dev/null
++++ b/drivers/watchdog/tc_wdt.c
+@@ -0,0 +1,355 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright (C) 2022 IOPSYS, Sweden
++ * Author: Mikhail Kshevetskiy <mikhail.kshevetskiy@iopsys.eu>
++ * Author: Michael Polyntsov <michael.polyntsov@iopsys.eu>
++ */
++
++#include <linux/module.h>
++#include <linux/moduleparam.h>
++#include <linux/types.h>
++#include <linux/timer.h>
++#include <linux/platform_device.h>
++#include <linux/watchdog.h>
++#include <linux/notifier.h>
++#include <linux/reboot.h>
++#include <linux/init.h>
++#include <linux/jiffies.h>
++#include <linux/kernel.h>
++#include <linux/fs.h>
++#include <linux/mm.h>
++#include <linux/proc_fs.h>
++#include <linux/delay.h>
++#include <asm/tc3162/ecnt_timer.h>
++#include <linux/version.h>
++#include <linux/cpumask.h>
++#include <asm/stacktrace.h>
++#include <asm/tc3162/tc3162.h>
++#include <linux/miscdevice.h>
++#include <linux/kthread.h>
++
++#define WDOG_TIMER		3
++#define HW_WATCHDOG_TIMEOUT	30 /* in seconds */
++#define KERNEL_TIMER_MAX_STEP	22 /* in seconds */
++
++/*
++ * Default is 300 seconds > MAX_TIMEOUT so
++ * probe reads from DT file timeout-sec
++ */
++#define TIMER_MARGIN	300
++#define MIN(a, b)	(((a) < (b)) ? (a) : (b))
++
++/* WATCHDOG_DEBUG_API -- enable/disable watchdog api debugging */
++//#define WATCHDOG_DEBUG_API
++
++#ifdef WATCHDOG_DEBUG_API
++#define WATCHDOG_DEBUG_PRINT_STAT(wdt_dev, caller, timeleft, timeout) \
++	printk("en75xx-wdt: %s, time=%lu, left=%d/%d, hw_timeout=%d/%d, max_step=%lu\n", \
++	       caller, jiffies / HZ, timeleft, timeout, \
++	       MIN(timeout, wdt_dev->hw_timeout), wdt_dev->hw_timeout, \
++	       wdt_dev->timer_max_step)
++#else
++#define WATCHDOG_DEBUG_PRINT_STAT(wdt_dev, caller, timeleft, timeout) ((void)(0))
++#endif
++
++struct tc_wdt_dev{
++	struct watchdog_device	wdt;
++	struct device		*dev;
++	struct notifier_block	reboot_notifier;
++	spinlock_t		lock;
++	int			hw_timeout;
++
++	int			started;
++	unsigned long		start_time; /* in jiffies */
++
++	struct timer_list	timer;
++	unsigned long		timer_margin;
++	unsigned long		timer_max_step;
++	int			timer_started;
++};
++
++static unsigned int timeout = TIMER_MARGIN;	/* in seconds */
++module_param(timeout, uint, 0);
++MODULE_PARM_DESC(timeout,
++	"Watchdog timeout in seconds "
++	"(default=" __MODULE_STRING(TIMER_MARGIN) ")");
++
++static bool nowayout = WATCHDOG_NOWAYOUT;
++module_param(nowayout, bool, 0);
++MODULE_PARM_DESC(nowayout,
++	"Watchdog cannot be stopped once started "
++	"(default=" __MODULE_STRING(WATCHDOG_NOWAYOUT) ")");
++
++extern void timerSet(uint32 timer_no, uint32 timerTime, uint32 enable,
++		     uint32 mode, uint32 halt);
++extern void timer_WatchDogConfigure (uint8 tick_enable, uint8 watchdog_enable);
++
++static void watchdog_hw_stop(void)
++{
++	unsigned long	flags;
++
++	local_irq_save(flags);
++	local_irq_disable();
++	timer_WatchDogConfigure(DISABLE, DISABLE);
++	local_irq_restore(flags);
++}
++
++static void watchdog_hw_set_and_start(uint32_t timeout)
++{
++	unsigned long	flags;
++
++	local_irq_save(flags);
++	local_irq_disable();
++	timer_WatchDogConfigure(DISABLE, DISABLE);
++	timerSet(WDOG_TIMER, timeout * TIMERTICKS_1S, ENABLE, TIMER_TOGGLEMODE,
++		 TIMER_HALTDISABLE);
++	timer_WatchDogConfigure(ENABLE, ENABLE);
++	local_irq_restore(flags);
++}
++
++static void watchdog_dev_timer_start(struct tc_wdt_dev *wdt_dev)
++{
++	unsigned long	time = jiffies, timeleft, step, step_cnt;
++
++	wdt_dev->timer_started = 0;
++	if (time_before(time, wdt_dev->timer_margin)) {
++		timeleft = wdt_dev->timer_margin - time;
++		step_cnt = (timeleft + wdt_dev->timer_max_step * HZ - 1) /
++			   (wdt_dev->timer_max_step * HZ);
++		step = timeleft / step_cnt;
++		wdt_dev->timer_started = 1;
++		mod_timer(&wdt_dev->timer, time + step);
++	}
++}
++
++static void watchdog_dev_timer_stop(struct tc_wdt_dev *wdt_dev)
++{
++	if (wdt_dev->timer_started) {
++		wdt_dev->timer_started = 0;
++		del_timer_sync(&wdt_dev->timer);
++	}
++}
++
++static uint32_t watchdog_dev_get_timeleft(struct tc_wdt_dev *wdt_dev)
++{
++	struct watchdog_device	*wdt = &wdt_dev->wdt;
++	uint32_t		timeleft;
++
++	if (!wdt_dev->started) return wdt->timeout;
++	timeleft = (wdt_dev->start_time + HZ * wdt->timeout) - jiffies;
++	if ((int)timeleft < 0) return 0;
++	return timeleft / HZ;
++}
++
++static void watchdog_dev_stop(struct tc_wdt_dev *wdt_dev)
++{
++	wdt_dev->started = 0;
++	watchdog_dev_timer_stop(wdt_dev);
++	watchdog_hw_stop();
++}
++
++static void watchdog_dev_start(struct tc_wdt_dev *wdt_dev)
++{
++	struct watchdog_device	*wdt = &wdt_dev->wdt;
++	uint32_t		timeout;
++
++	timeout = MIN(wdt->timeout, wdt_dev->hw_timeout);
++	wdt_dev->started = 1;
++	wdt_dev->start_time = jiffies;
++	if (timeout < wdt->timeout) {
++		wdt_dev->timer_margin = wdt_dev->start_time + HZ *
++				       (wdt->timeout - timeout);
++		watchdog_dev_timer_start(wdt_dev);
++	}
++	else {
++		watchdog_dev_timer_stop(wdt_dev);
++	}
++	watchdog_hw_set_and_start(timeout);
++}
++
++static void tc_wdt_timer_function(struct timer_list *t)
++{
++	struct tc_wdt_dev	*wdt_dev = from_timer(wdt_dev, t, timer);
++	struct watchdog_device	*wdt = &wdt_dev->wdt;
++	uint32_t		timeout;
++
++	spin_lock(&wdt_dev->lock);
++	timeout = MIN(wdt->timeout, wdt_dev->hw_timeout);
++	WATCHDOG_DEBUG_PRINT_STAT(wdt_dev, "timer", watchdog_dev_get_timeleft(wdt_dev), wdt->timeout);
++	watchdog_dev_timer_start(wdt_dev);
++	watchdog_hw_set_and_start(timeout);
++	spin_unlock(&wdt_dev->lock);
++}
++
++static int tc_wdt_start(struct watchdog_device *wdt)
++{
++	struct tc_wdt_dev	*wdt_dev = watchdog_get_drvdata(wdt);
++
++	spin_lock(&wdt_dev->lock);
++	WATCHDOG_DEBUG_PRINT_STAT(wdt_dev, "start", wdt->timeout, wdt->timeout);
++	watchdog_dev_start(wdt_dev);
++	spin_unlock(&wdt_dev->lock);
++	return 0;
++}
++
++static int tc_wdt_ping(struct watchdog_device *wdt)
++{
++	struct tc_wdt_dev	*wdt_dev = watchdog_get_drvdata(wdt);
++
++	spin_lock(&wdt_dev->lock);
++	WATCHDOG_DEBUG_PRINT_STAT(wdt_dev, "ping", watchdog_dev_get_timeleft(wdt_dev), wdt->timeout);
++	watchdog_dev_start(wdt_dev);
++	spin_unlock(&wdt_dev->lock);
++	return 0;
++}
++
++static int tc_wdt_stop(struct watchdog_device *wdt)
++{
++	struct tc_wdt_dev	*wdt_dev = watchdog_get_drvdata(wdt);
++
++	spin_lock(&wdt_dev->lock);
++	WATCHDOG_DEBUG_PRINT_STAT(wdt_dev, "stop", watchdog_dev_get_timeleft(wdt_dev), wdt->timeout);
++	watchdog_dev_stop(wdt_dev);
++	spin_unlock(&wdt_dev->lock);
++	return 0;
++}
++
++static uint32_t tc_wdt_get_timeleft(struct watchdog_device *wdt)
++{
++	struct tc_wdt_dev	*wdt_dev = watchdog_get_drvdata(wdt);
++	uint32_t		timeleft;
++
++	spin_lock(&wdt_dev->lock);
++	timeleft = watchdog_dev_get_timeleft(wdt_dev);
++	spin_unlock(&wdt_dev->lock);
++	return timeleft;
++}
++
++static int tc_wdt_set_timeout(struct watchdog_device *wdt,
++			      unsigned int timeout)
++{
++	struct tc_wdt_dev	*wdt_dev = watchdog_get_drvdata(wdt);
++
++	spin_lock(&wdt_dev->lock);
++	wdt->timeout = (timeout != 0) ? timeout : wdt->max_timeout;
++#ifdef WATCHDOG_DEBUG_API
++	printk("en75xx-wdt: set_timeout(%d), timeout=%d\n", timeout, wdt->timeout);
++#endif
++	if (wdt_dev->started)
++		watchdog_dev_start(wdt_dev);
++	spin_unlock(&wdt_dev->lock);
++	return 0;
++}
++
++static int tc_wdt_notify_sys(struct notifier_block *this, unsigned long code,
++			     void *unused)
++{
++	if (code == SYS_DOWN || code == SYS_HALT) {
++		struct tc_wdt_dev *wdt_dev = container_of(this,
++							  struct tc_wdt_dev,
++							  reboot_notifier);
++#ifdef WATCHDOG_DEBUG_API
++		printk("en75xx-wdt: reboot notification, %s watchdog\n",
++		       (timeout < 0) ? "stop" : "start");
++#endif
++		/* Turn the WDT off */
++		tc_wdt_stop(&wdt_dev->wdt);
++	}
++	return NOTIFY_DONE;
++}
++
++static const struct watchdog_info tc_wdt_info = {
++	.options = WDIOF_SETTIMEOUT | WDIOF_KEEPALIVEPING | WDIOF_MAGICCLOSE,
++	.identity = "Hardware Watchdog for en7512",
++};
++
++static const struct watchdog_ops tc_wdt_ops = {
++	.owner = THIS_MODULE,
++	.start = tc_wdt_start,
++	.stop  = tc_wdt_stop,
++	.ping  = tc_wdt_ping,
++	.set_timeout  = tc_wdt_set_timeout,
++	.get_timeleft = tc_wdt_get_timeleft,
++};
++
++static int tc_wdt_probe(struct platform_device *pdev)
++{
++	int ret;
++	struct tc_wdt_dev *wdt_dev;
++
++	wdt_dev = devm_kzalloc(&pdev->dev, sizeof(*wdt_dev), GFP_KERNEL);
++	if (!wdt_dev)
++		return -ENOMEM;
++
++	wdt_dev->dev = &pdev->dev;
++	spin_lock_init(&wdt_dev->lock);
++	wdt_dev->reboot_notifier.notifier_call = tc_wdt_notify_sys;
++	wdt_dev->hw_timeout = HW_WATCHDOG_TIMEOUT;
++	wdt_dev->started = 0;
++	wdt_dev->timer_started = 0;
++	wdt_dev->timer_max_step = KERNEL_TIMER_MAX_STEP;
++	timer_setup(&wdt_dev->timer, tc_wdt_timer_function, 0);
++
++	wdt_dev->wdt.info = &tc_wdt_info;
++	wdt_dev->wdt.ops  = &tc_wdt_ops;
++	wdt_dev->wdt.timeout = 30;
++	wdt_dev->wdt.min_timeout = 0;
++	wdt_dev->wdt.max_timeout = 60; /* 1 minute */
++	wdt_dev->wdt.parent = &pdev->dev;
++
++	ret = register_reboot_notifier(&wdt_dev->reboot_notifier);
++	if (ret) {
++		dev_err(&pdev->dev, "cannot register reboot notifier\n");
++		return ret;
++	}
++
++	if (watchdog_init_timeout(&wdt_dev->wdt, timeout, &pdev->dev) < 0)
++		wdt_dev->wdt.timeout = 30;
++
++	watchdog_set_nowayout(&wdt_dev->wdt, nowayout);
++	watchdog_set_drvdata(&wdt_dev->wdt, wdt_dev);
++	platform_set_drvdata(pdev, wdt_dev);
++
++	ret = watchdog_register_device(&wdt_dev->wdt);
++	if (ret) dev_err(&pdev->dev, "cannot register watchdog device\n");
++
++	return ret;
++}
++
++static int __exit tc_wdt_remove(struct platform_device *pdev)
++{
++	struct tc_wdt_dev *wdt_dev = platform_get_drvdata(pdev);
++
++	tc_wdt_stop(&wdt_dev->wdt);
++	unregister_reboot_notifier(&wdt_dev->reboot_notifier);
++	watchdog_unregister_device(&wdt_dev->wdt);
++	return 0;
++}
++
++static void tc_wdt_shutdown(struct platform_device *pdev)
++{
++	struct tc_wdt_dev *wdt_dev = platform_get_drvdata(pdev);
++	tc_wdt_stop(&wdt_dev->wdt);
++}
++
++static const struct of_device_id tc_wdt_match[] = {
++	{ .compatible = "airoha,en75xx-wdt" },
++	{},
++};
++
++static struct platform_driver tc_wdt_driver = {
++	.probe = tc_wdt_probe,
++	.remove = __exit_p(tc_wdt_remove),
++	.shutdown = tc_wdt_shutdown,
++	.driver = {
++		.name = "en75xx-wdt",
++		.owner = THIS_MODULE,
++		.of_match_table = tc_wdt_match,
++	},
++};
++
++module_platform_driver(tc_wdt_driver);
++
++MODULE_DESCRIPTION("en75xx Watchdog Driver");
++MODULE_LICENSE("GPL");
++MODULE_ALIAS("platform:en75xx-wdt");
